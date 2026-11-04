@@ -1,49 +1,48 @@
 import requests
-from bs4 import BeautifulSoup
 import boto3
 import uuid
 
 def lambda_handler(event, context):
-    url = "https://ultimosismo.igp.gob.pe/productos/reportes-sismicos"
+    # Consumimos la API directamente
+    url = "https://ultimosismo.igp.gob.pe/api/ultimo-sismo/ajaxb/AAAA"
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
 
-    # verify=False omite errores de certificados de seguridad
-    response = requests.get(url, headers=headers, verify=False, timeout=15)
-    
+    # verify=False permite saltar el bloqueo del certificado SSL en AWS Lambda
+    try:
+        response = requests.get(url, headers=headers, verify=False, timeout=15)
+    except Exception as e:
+        return {'statusCode': 500, 'body': f'Error de conexión: {str(e)}'}
+
     if response.status_code != 200:
         return {
-            'statusCode': response.status_code,
-            'body': f'Fallo de conexión. IGP respondió: {response.text[:300]}'
+            'statusCode': response.status_code, 
+            'body': f'Error en API. Respondió: {response.text[:200]}'
         }
 
-    soup = BeautifulSoup(response.content, 'html.parser')
-    table = soup.find('table')
-    
-    if not table:
-        return {
-            'statusCode': 404,
-            'body': f'No hay tabla. HTML recibido: {response.text[:300]}'
-        }
-
-    headers_list = [header.text for header in table.find_all('th')]
-    rows = []
-    for row in table.find_all('tr')[1:11]:  # Límite de 10 sismos
-        cells = row.find_all('td')
-        rows.append({headers_list[i+1]: cell.text for i, cell in enumerate(cells)})
+    # Procesar el JSON y tomar solo los 10 primeros
+    sismos_totales = response.json()
+    ultimos_10 = sismos_totales[:10]
 
     # Guardar en DynamoDB
     dynamodb = boto3.resource('dynamodb')
-    table_db = dynamodb.Table('TablaWebScrapping')
-    
-    with table_db.batch_writer() as batch:
-        for each in table_db.scan()['Items']:
+    table = dynamodb.Table('TablaWebScrapping')
+
+    # Limpiar tabla
+    scan = table.scan()
+    with table.batch_writer() as batch:
+        for each in scan['Items']:
             batch.delete_item(Key={'id': each['id']})
 
-    for index, row in enumerate(rows, start=1):
-        row['#'] = str(index)
-        row['id'] = str(uuid.uuid4())
-        table_db.put_item(Item=row)
+    # Insertar los 10 sismos
+    for index, sismo in enumerate(ultimos_10, start=1):
+        item = {k: str(v) for k, v in sismo.items()} # Convertir todo a string por seguridad
+        item['#'] = str(index)
+        item['id'] = str(uuid.uuid4())
+        table.put_item(Item=item)
 
-    return {'statusCode': 200, 'body': rows}
+    return {
+        'statusCode': 200,
+        'body': ultimos_10
+    }
