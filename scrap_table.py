@@ -1,49 +1,49 @@
 import requests
+from bs4 import BeautifulSoup
 import boto3
 import uuid
 
 def lambda_handler(event, context):
-    # Apuntamos directamente a la API JSON oculta del IGP en lugar de la web HTML
-    url = "https://ultimosismo.igp.gob.pe/api/ultimo-sismo/ajaxb/AAAA"
-    
+    url = "https://ultimosismo.igp.gob.pe/productos/reportes-sismicos"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
 
-    # Realizar petición
-    response = requests.get(url, headers=headers)
+    # verify=False omite errores de certificados de seguridad
+    response = requests.get(url, headers=headers, verify=False, timeout=15)
+    
     if response.status_code != 200:
         return {
-            'statusCode': response.status_code, 
-            'body': 'Error al acceder a la API JSON del IGP'
+            'statusCode': response.status_code,
+            'body': f'Fallo de conexión. IGP respondió: {response.text[:300]}'
         }
 
-    # Convertir la respuesta HTTP directamente en una lista de diccionarios de Python
-    sismos_totales = response.json()
+    soup = BeautifulSoup(response.content, 'html.parser')
+    table = soup.find('table')
     
-    # Slice para extraer únicamente los 10 primeros sismos de la lista
-    ultimos_10 = sismos_totales[:10]
+    if not table:
+        return {
+            'statusCode': 404,
+            'body': f'No hay tabla. HTML recibido: {response.text[:300]}'
+        }
 
-    # Conectar a DynamoDB
+    headers_list = [header.text for header in table.find_all('th')]
+    rows = []
+    for row in table.find_all('tr')[1:11]:  # Límite de 10 sismos
+        cells = row.find_all('td')
+        rows.append({headers_list[i+1]: cell.text for i, cell in enumerate(cells)})
+
+    # Guardar en DynamoDB
     dynamodb = boto3.resource('dynamodb')
-    table = dynamodb.Table('TablaWebScrapping')
-
-    # Eliminar todos los elementos antiguos (Clean up)
-    scan = table.scan()
-    with table.batch_writer() as batch:
-        for each in scan['Items']:
+    table_db = dynamodb.Table('TablaWebScrapping')
+    
+    with table_db.batch_writer() as batch:
+        for each in table_db.scan()['Items']:
             batch.delete_item(Key={'id': each['id']})
 
-    # Guardar los 10 nuevos registros
-    for index, sismo in enumerate(ultimos_10, start=1):
-        # Convertimos los valores a string para evitar que DynamoDB rechace valores tipo Float
-        item = {k: str(v) for k, v in sismo.items()}
-        item['#'] = str(index)
-        item['id'] = str(uuid.uuid4())
-        
-        table.put_item(Item=item)
+    for index, row in enumerate(rows, start=1):
+        row['#'] = str(index)
+        row['id'] = str(uuid.uuid4())
+        table_db.put_item(Item=row)
 
-    return {
-        'statusCode': 200,
-        'body': 'Los 10 ultimos sismos se actualizaron correctamente en DynamoDB'
-    }
+    return {'statusCode': 200, 'body': rows}
